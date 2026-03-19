@@ -80,10 +80,15 @@ class ICEReportScraper:
         page = context.new_page()
         try:
             logger.info("Visiting ICE Report Center to discover reports...")
-            page.goto(config.ICE_REPORT_CENTER_URL, wait_until="networkidle",
+            page.goto(config.ICE_REPORT_CENTER_URL, wait_until="domcontentloaded",
                       timeout=config.PAGE_LOAD_TIMEOUT)
-            # Wait for dynamic content to load
-            time.sleep(3)
+            # Wait for SPA content to render
+            time.sleep(5)
+            # Try waiting for report links to appear
+            try:
+                page.wait_for_selector("a[href*='/report/']", timeout=10000)
+            except PlaywrightTimeout:
+                logger.info("No report links found after waiting, continuing...")
 
             # Look for links matching /report/{id} pattern
             links = page.query_selector_all("a[href*='/report/']")
@@ -114,9 +119,10 @@ class ICEReportScraper:
 
         page = context.new_page()
         try:
-            page.goto(url, wait_until="networkidle",
+            page.goto(url, wait_until="domcontentloaded",
                       timeout=config.PAGE_LOAD_TIMEOUT)
-            time.sleep(2)
+            # Wait for SPA content to render
+            time.sleep(5)
 
             pdf_links = self._find_pdf_links(page)
             download_buttons = self._find_download_buttons(page)

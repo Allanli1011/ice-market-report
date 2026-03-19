@@ -55,7 +55,7 @@ class PDFParser:
                             "text": text,
                         })
 
-                    # Extract tables
+                    # Extract tables (pdfplumber structured tables)
                     tables = page.extract_tables() or []
                     for table_idx, table in enumerate(tables):
                         if table and len(table) > 0:
@@ -67,6 +67,18 @@ class PDFParser:
                                     "headers": cleaned[0] if cleaned else [],
                                     "rows": cleaned[1:] if len(cleaned) > 1 else [],
                                 })
+
+                    # Fallback: if no structured tables found, try to parse
+                    # tabular data from text (common in ICE reports)
+                    if not tables and text.strip():
+                        text_tables = self._extract_tables_from_text(text)
+                        for table_idx, table in enumerate(text_tables):
+                            result["tables"].append({
+                                "page": page_num,
+                                "table_index": table_idx,
+                                "headers": table[0] if table else [],
+                                "rows": table[1:] if len(table) > 1 else [],
+                            })
 
                 # Try to extract report title from the first page
                 if result["text_content"]:
@@ -126,6 +138,62 @@ class PDFParser:
             if any(c.strip() for c in cleaned_row):
                 cleaned.append(cleaned_row)
         return cleaned
+
+    def _extract_tables_from_text(self, text: str) -> list[list[list[str]]]:
+        """Try to extract tabular data from plain text.
+
+        Uses two strategies:
+        1. Lines with 2+ space gaps (formatted tables)
+        2. Lines where the last N tokens are numeric (data rows)
+        """
+        tables = []
+        lines = text.strip().split("\n")
+
+        # Strategy 1: Split on 2+ spaces
+        current_table = []
+        for line in lines:
+            parts = re.split(r"\s{2,}", line.strip())
+            if len(parts) >= 3:
+                current_table.append(parts)
+            else:
+                if len(current_table) >= 2:
+                    tables.append(current_table)
+                current_table = []
+        if len(current_table) >= 2:
+            tables.append(current_table)
+
+        # Strategy 2: If no tables found, look for lines ending with numbers
+        if not tables:
+            current_table = []
+            header_line = None
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                tokens = stripped.split()
+                if len(tokens) < 3:
+                    continue
+                # Check if at least the last 2 tokens look numeric
+                numeric_tail = sum(
+                    1 for t in tokens[-3:]
+                    if re.match(r'^[\d,]+\.?\d*$', t.replace(',', ''))
+                )
+                if numeric_tail >= 2:
+                    if not current_table and header_line:
+                        current_table.append(header_line.split())
+                    current_table.append(tokens)
+                else:
+                    if len(current_table) >= 2:
+                        tables.append(current_table)
+                    current_table = []
+                    # Remember as potential header
+                    if len(tokens) >= 3:
+                        header_line = stripped
+
+            if len(current_table) >= 2:
+                tables.append(current_table)
+
+        return tables
 
     def _extract_title(self, first_page_text: str) -> str:
         """Try to extract the report title from the first page text."""
