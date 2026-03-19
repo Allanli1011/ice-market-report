@@ -57,9 +57,8 @@ class ExcelGenerator:
         # 1. Create Summary sheet
         self._create_summary_sheet(wb, parsed_data)
 
-        # 2. Create a sheet for each report's tables
-        for idx, report in enumerate(parsed_data):
-            self._create_report_sheet(wb, report, idx)
+        # 2. Create a single consolidated sheet with all report table data
+        self._create_consolidated_sheet(wb, parsed_data)
 
         # 3. Create a raw text sheet for reference
         self._create_text_sheet(wb, parsed_data)
@@ -112,64 +111,58 @@ class ExcelGenerator:
         # Auto-fit column widths
         self._auto_fit_columns(ws)
 
-    def _create_report_sheet(self, wb: Workbook, report: dict, index: int):
-        """Create a sheet for a single report's table data."""
-        tables = report.get("tables", [])
-        if not tables:
-            return
+    def _create_consolidated_sheet(self, wb: Workbook, parsed_data: list[dict]):
+        """Create a single sheet with all report table data consolidated."""
+        ws = wb.create_sheet("All Reports Data")
 
-        dl_info = report.get("download_info", {})
-        report_name = dl_info.get("report_name", report.get("filename", f"Report_{index}"))
+        # Title
+        ws.merge_cells("A1:H1")
+        title_cell = ws["A1"]
+        title_cell.value = f"ICE Market Reports Data - {datetime.now().strftime('%Y-%m-%d')}"
+        title_cell.font = Font(bold=True, size=14, color="1F4E79")
+        title_cell.alignment = Alignment(horizontal="center")
 
-        # Truncate sheet name to 31 chars (Excel limit)
-        sheet_name = report_name[:28].strip()
-        # Remove invalid characters for sheet names
-        for char in r"[]:*?/\\":
-            sheet_name = sheet_name.replace(char, "_")
+        current_row = 3
 
-        # Handle duplicate sheet names
-        existing = [s.title for s in wb.worksheets]
-        if sheet_name in existing:
-            sheet_name = f"{sheet_name[:25]}_{index}"
+        for idx, report in enumerate(parsed_data):
+            tables = report.get("tables", [])
+            if not tables:
+                continue
 
-        ws = wb.create_sheet(sheet_name)
+            dl_info = report.get("download_info", {})
+            report_name = dl_info.get("report_name", report.get("filename", f"Report_{idx}"))
 
-        current_row = 1
-
-        # Sheet title
-        ws.merge_cells(f"A{current_row}:H{current_row}")
-        cell = ws.cell(row=current_row, column=1, value=report_name)
-        cell.font = Font(bold=True, size=12, color="1F4E79")
-        current_row += 2
-
-        for table in tables:
-            # Table header label
-            page = table.get("page", "?")
-            ws.cell(
-                row=current_row, column=1,
-                value=f"Table from Page {page}",
-            ).font = SUBHEADER_FONT
+            # Report section header
+            ws.merge_cells(f"A{current_row}:H{current_row}")
+            cell = ws.cell(row=current_row, column=1, value=report_name)
+            cell.font = Font(bold=True, size=12, color="FFFFFF")
+            cell.fill = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
+            cell.alignment = Alignment(horizontal="left")
             current_row += 1
 
-            # Column headers
-            headers = table.get("headers", [])
-            if headers:
-                for col, h in enumerate(headers, 1):
-                    cell = ws.cell(row=current_row, column=col, value=h)
-                    cell.font = HEADER_FONT
-                    cell.fill = HEADER_FILL
-                    cell.border = THIN_BORDER
+            for table in tables:
+                # Column headers
+                headers = table.get("headers", [])
+                if headers:
+                    for col, h in enumerate(headers, 1):
+                        cell = ws.cell(row=current_row, column=col, value=h)
+                        cell.font = HEADER_FONT
+                        cell.fill = HEADER_FILL
+                        cell.border = THIN_BORDER
+                    current_row += 1
+
+                # Data rows
+                for row_data in table.get("rows", []):
+                    for col, val in enumerate(row_data, 1):
+                        cell = ws.cell(row=current_row, column=col, value=self._try_numeric(val))
+                        cell.border = THIN_BORDER
+                    current_row += 1
+
+                # Small gap between tables from the same report
                 current_row += 1
 
-            # Data rows
-            for row_data in table.get("rows", []):
-                for col, val in enumerate(row_data, 1):
-                    cell = ws.cell(row=current_row, column=col, value=self._try_numeric(val))
-                    cell.border = THIN_BORDER
-                current_row += 1
-
-            # Gap between tables
-            current_row += 2
+            # Larger gap between reports
+            current_row += 1
 
         self._auto_fit_columns(ws)
 
