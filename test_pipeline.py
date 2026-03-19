@@ -12,6 +12,7 @@ from pathlib import Path
 import config
 from pdf_parser import PDFParser
 from excel_generator import ExcelGenerator
+from trading_calendar import TradingCalendar, extract_date_from_text, extract_date_from_filename
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,6 +121,32 @@ def main():
             "file_size": filepath.stat().st_size,
         })
         logger.info("Created test PDF: %s (%d bytes)", name, filepath.stat().st_size)
+
+    # Step 0: Validate report dates
+    logger.info("\n[Step 0] Validating report dates against trading calendar...")
+    calendar = TradingCalendar()
+    today = datetime.now().date()
+    expected_date = calendar.get_expected_report_date(7, today)
+    logger.info("  Expected report date (last trading day): %s", expected_date)
+
+    for file_info in test_files:
+        filepath = file_info["filepath"]
+        # Extract date from PDF text
+        import pdfplumber
+        with pdfplumber.open(filepath) as pdf:
+            text = pdf.pages[0].extract_text() or ""
+            report_date = extract_date_from_text(text)
+            is_valid = calendar.validate_report_date(report_date, file_info["report_id"], today) if report_date else None
+            logger.info(
+                "  %s: extracted date=%s, valid=%s",
+                file_info["filename"], report_date, is_valid,
+            )
+
+    # Test stale report detection
+    logger.info("\n  Stale report test: date 2026-03-16 should be invalid")
+    from datetime import date
+    is_stale = not calendar.validate_report_date(date(2026, 3, 16), 7, today)
+    logger.info("  Date 2026-03-16 is stale: %s", is_stale)
 
     # Step 1: Parse PDFs
     logger.info("\n[Step 1] Parsing PDFs...")
