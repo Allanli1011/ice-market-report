@@ -1,0 +1,17 @@
+[project]
+name = "ice-market-report"
+version = "0.1.0"
+description = "Automated ICE market report scraper: downloads PDFs, extracts data, and generates Excel reports"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.40.0",
+    "pdfplumber>=0.10.0",
+    "openpyxl>=3.1.0",
+    "pandas>=2.0.0",
+    "schedule>=1.2.0",
+    "exchange_calendars>=4.5.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+ice-market-report = "main:main"
