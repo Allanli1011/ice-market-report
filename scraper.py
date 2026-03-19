@@ -8,6 +8,7 @@ pauses for the user to solve it manually in the visible browser window.
 """
 
 import logging
+import json
 import re
 import time
 from datetime import datetime
@@ -20,6 +21,24 @@ import config
 
 logger = logging.getLogger(__name__)
 
+IGNORED_OPTION_LABEL_KEYWORDS = {
+    "functional cookies",
+    "performance cookies",
+    "targeting cookies",
+    "social media cookies",
+    "cookie",
+    "privacy",
+    "consent",
+    "checkbox label",
+}
+
+IGNORED_LINK_TEXT_KEYWORDS = {
+    "click-through agreement",
+    "agreement",
+    "privacy notice",
+    "cookie",
+}
+
 
 class ICEReportScraper:
     """Scrapes ICE (Intercontinental Exchange) website for market report PDFs."""
@@ -28,6 +47,10 @@ class ICEReportScraper:
         self.download_dir = download_dir or config.PDF_DIR
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.downloaded_files: list[dict] = []
+        self.browser_profile_dir = config.BASE_DIR / ".browser_profile"
+        self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
+        self.session_state_path = self.browser_profile_dir / "storage_state.json"
+        self._downloaded_urls: set[str] = set()
 
     def run(self) -> list[dict]:
         """Main entry point: scrape all configured reports and download PDFs."""
@@ -36,13 +59,9 @@ class ICEReportScraper:
         today_dir = self.download_dir / today
         today_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use a persistent browser profile so cookies/sessions survive across runs
-        user_data_dir = config.BASE_DIR / ".browser_profile"
-        user_data_dir.mkdir(parents=True, exist_ok=True)
-
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
+                user_data_dir=str(self.browser_profile_dir),
                 headless=config.HEADLESS,
                 accept_downloads=True,
                 user_agent=(
@@ -50,15 +69,19 @@ class ICEReportScraper:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
+                args=["--disable-blink-features=AutomationControlled"],
             )
             context.set_default_timeout(config.BROWSER_TIMEOUT)
 
             try:
+                self._restore_session_state(context)
+                page = context.pages[0] if context.pages else context.new_page()
+
                 # Step 0: Open a page to let the user clear any CAPTCHA first
-                self._wait_for_captcha_clearance(context)
+                self._wait_for_captcha_clearance(page, context)
 
                 # Step 1: Discover reports from the report center
-                discovered = self._discover_reports_from_center(context)
+                discovered = self._discover_reports_from_center(page)
 
                 # Step 2: Scrape each known report page for PDF links
                 all_report_ids = set(config.REPORT_IDS.keys())
@@ -71,7 +94,7 @@ class ICEReportScraper:
                     )
                     try:
                         self._scrape_report_page(
-                            context, report_id, report_name, today_dir
+                            page, context, report_id, report_name, today_dir
                         )
                     except Exception as e:
                         logger.error(
@@ -90,13 +113,12 @@ class ICEReportScraper:
     # CAPTCHA / Agreement Handling
     # ------------------------------------------------------------------ #
 
-    def _wait_for_captcha_clearance(self, context):
+    def _wait_for_captcha_clearance(self, page, context):
         """Open ICE and wait for the user to clear any CAPTCHA.
 
         In headed mode the browser window is visible for the user to
         interact with. The script polls until the reCAPTCHA disappears.
         """
-        page = context.new_page()
         try:
             logger.info("Opening ICE website for initial session setup...")
             page.goto(config.ICE_REPORT_CENTER_URL, wait_until="domcontentloaded",
@@ -133,12 +155,11 @@ class ICEReportScraper:
 
             # Handle the "I ACCEPT" agreement if present
             self._handle_accept_agreement(page)
+            self._persist_session_state(context)
             time.sleep(2)
 
         except PlaywrightTimeout as e:
             logger.warning("Timeout during initial page load: %s", e)
-        finally:
-            page.close()
 
     def _is_captcha_present(self, page) -> bool:
         """Check if any CAPTCHA / bot protection is blocking the page."""
@@ -202,10 +223,9 @@ class ICEReportScraper:
     # Report Discovery
     # ------------------------------------------------------------------ #
 
-    def _discover_reports_from_center(self, context) -> set[int]:
+    def _discover_reports_from_center(self, page) -> set[int]:
         """Visit the ICE Report Center and discover available report IDs."""
         discovered_ids = set()
-        page = context.new_page()
         try:
             logger.info("Visiting ICE Report Center to discover reports...")
             page.goto(config.ICE_REPORT_CENTER_URL, wait_until="domcontentloaded",
@@ -236,8 +256,6 @@ class ICEReportScraper:
             )
         except (PlaywrightTimeout, Exception) as e:
             logger.warning("Could not fully load Report Center: %s", e)
-        finally:
-            page.close()
 
         return discovered_ids
 
@@ -245,13 +263,12 @@ class ICEReportScraper:
     # Per-Report Scraping
     # ------------------------------------------------------------------ #
 
-    def _scrape_report_page(self, context, report_id: int, report_name: str,
+    def _scrape_report_page(self, page, context, report_id: int, report_name: str,
                             save_dir: Path):
         """Visit a specific report page and download any available PDFs."""
         url = f"{config.ICE_BASE_URL}/report/{report_id}"
         logger.info("Scraping report %d: %s (%s)", report_id, report_name, url)
 
-        page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded",
                       timeout=config.PAGE_LOAD_TIMEOUT)
@@ -279,37 +296,52 @@ class ICEReportScraper:
 
             # Handle cookies / agreement overlay
             self._handle_accept_agreement(page)
+            self._persist_session_state(context)
             time.sleep(2)
 
-            pdf_links = self._find_pdf_links(page)
-            download_buttons = self._find_download_buttons(page)
+            found_downloads = self._download_from_current_view(
+                page, report_id, report_name, save_dir
+            )
+            option_downloads = self._download_from_option_matrix(
+                page, report_id, report_name, save_dir
+            )
 
-            # Download PDFs from direct links
-            for pdf_url, link_text in pdf_links:
-                self._download_pdf_via_link(
-                    page, pdf_url, link_text, report_id, report_name, save_dir
-                )
-
-            # Try clicking download buttons that might trigger PDF downloads
-            for button in download_buttons:
-                self._download_pdf_via_button(
-                    page, button, report_id, report_name, save_dir
-                )
-
-            # If no PDFs found via links/buttons, try alternatives
-            if not pdf_links and not download_buttons:
+            # If nothing was found, try a final fallback scan.
+            if not found_downloads and not option_downloads:
                 self._try_alternative_download(
                     page, report_id, report_name, save_dir
                 )
 
         except (PlaywrightTimeout, Exception) as e:
             logger.warning("Error scraping report %d: %s", report_id, e)
-        finally:
-            page.close()
 
     # ------------------------------------------------------------------ #
     # PDF Discovery & Download Helpers
     # ------------------------------------------------------------------ #
+
+    def _download_from_current_view(
+        self, page, report_id: int, report_name: str, save_dir: Path
+    ) -> bool:
+        """Download all visible PDF assets on the current page state."""
+        found_any = False
+        pdf_links = self._find_pdf_links(page)
+        download_buttons = self._find_download_buttons(page)
+
+        # Download PDFs from direct links.
+        for pdf_url, link_text in pdf_links:
+            found_any = True
+            self._download_pdf_via_link(
+                page, pdf_url, link_text, report_id, report_name, save_dir
+            )
+
+        # Try clicking download buttons that might trigger PDF downloads.
+        for button in download_buttons:
+            found_any = True
+            self._download_pdf_via_button(
+                page, button, report_id, report_name, save_dir
+            )
+
+        return found_any
 
     def _find_pdf_links(self, page) -> list[tuple[str, str]]:
         """Find all PDF download links on the page."""
@@ -339,10 +371,159 @@ class ICEReportScraper:
 
         return pdf_links
 
+    def _download_from_option_matrix(
+        self, page, report_id: int, report_name: str, save_dir: Path
+    ) -> bool:
+        """Traverse checkbox/radio options that reveal report download links."""
+        controls = page.locator(
+            "main input[type='checkbox'], "
+            "main input[type='radio'], "
+            "[role='main'] input[type='checkbox'], "
+            "[role='main'] input[type='radio'], "
+            "[class*='report'] input[type='checkbox'], "
+            "[class*='report'] input[type='radio']"
+        )
+        try:
+            control_count = controls.count()
+        except Exception:
+            return False
+
+        if control_count == 0:
+            return False
+
+        logger.info("  Found %d selectable option(s); traversing them...", control_count)
+        downloaded_any = False
+        seen_labels: set[str] = set()
+
+        for idx in range(control_count):
+            control = page.locator("input[type='checkbox'], input[type='radio']").nth(idx)
+            descriptor = self._describe_option(control, idx)
+            option_label = descriptor["label"]
+            option_type = descriptor["type"]
+
+            if (
+                not option_label
+                or self._should_ignore_option_label(option_label)
+                or option_label.lower() in {"all", "select all", "all reports"}
+                or option_label in seen_labels
+            ):
+                continue
+
+            seen_labels.add(option_label)
+
+            if not self._is_option_interactable(control):
+                continue
+
+            logger.info("  Exploring option: %s", option_label)
+            was_checked = self._is_checked(control)
+
+            if not was_checked:
+                if not self._set_option_state(control, checked=True):
+                    logger.info("  Could not activate option: %s", option_label)
+                    continue
+            else:
+                logger.info("  Option already active, using current view.")
+
+            self._wait_for_page_update(page)
+            self._handle_accept_agreement(page)
+            current_view_has_assets = self._download_from_current_view(
+                page, report_id, report_name, save_dir
+            )
+            if current_view_has_assets:
+                downloaded_any = True
+
+            if option_type == "checkbox" and not was_checked:
+                self._set_option_state(control, checked=False)
+                self._wait_for_page_update(page)
+
+        return downloaded_any
+
+    def _describe_option(self, control, index: int) -> dict:
+        """Extract a stable display label for a checkbox/radio option."""
+        try:
+            data = control.evaluate(
+                """(node, idx) => {
+                    const textFromLabel = () => {
+                        if (node.id) {
+                            const linked = document.querySelector(`label[for="${node.id}"]`);
+                            if (linked && linked.innerText) {
+                                return linked.innerText.trim();
+                            }
+                        }
+                        const wrappingLabel = node.closest("label");
+                        if (wrappingLabel && wrappingLabel.innerText) {
+                            return wrappingLabel.innerText.trim();
+                        }
+                        const parentText = node.parentElement?.innerText || "";
+                        return parentText.trim();
+                    };
+
+                    return {
+                        index: idx,
+                        type: node.type || "checkbox",
+                        label: (
+                            node.getAttribute("aria-label")
+                            || textFromLabel()
+                            || node.getAttribute("value")
+                            || `option-${idx + 1}`
+                        ).replace(/\\s+/g, " ").trim(),
+                    };
+                }""",
+                index,
+            )
+            return data
+        except Exception:
+            return {
+                "index": index,
+                "type": "checkbox",
+                "label": f"option-{index + 1}",
+            }
+
+    def _is_option_interactable(self, control) -> bool:
+        """Whether an option can be clicked in the current DOM state."""
+        try:
+            return control.is_enabled()
+        except Exception:
+            return False
+
+    def _is_checked(self, control) -> bool:
+        """Best-effort check for checkbox/radio state."""
+        try:
+            return control.is_checked()
+        except Exception:
+            return False
+
+    def _set_option_state(self, control, checked: bool) -> bool:
+        """Toggle an option even when the native input is hidden/styled."""
+        try:
+            if checked:
+                control.check(force=True)
+            else:
+                control.uncheck(force=True)
+            return True
+        except Exception:
+            try:
+                control.click(force=True)
+                return True
+            except Exception:
+                return False
+
+    def _wait_for_page_update(self, page):
+        """Allow reactive report links to render after a selection changes."""
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            time.sleep(2)
+
     def _find_download_buttons(self, page) -> list:
         """Find download buttons that might trigger PDF downloads."""
         buttons = []
         selectors = [
+            "main button:has-text('Download')",
+            "main button:has-text('PDF')",
+            "main button:has-text('Export')",
+            "main a:has-text('Download PDF')",
+            "main a:has-text('Download Report')",
             "button:has-text('Download')",
             "button:has-text('PDF')",
             "button:has-text('Export')",
@@ -365,6 +546,11 @@ class ICEReportScraper:
                                report_id: int, report_name: str, save_dir: Path):
         """Download a PDF file from a direct URL."""
         try:
+            if pdf_url in self._downloaded_urls:
+                return
+            if self._should_ignore_download(link_text, pdf_url):
+                return
+
             url_filename = Path(urlparse(pdf_url).path).name
             if not url_filename.endswith(".pdf"):
                 url_filename = f"report_{report_id}_{link_text[:30]}.pdf"
@@ -379,6 +565,7 @@ class ICEReportScraper:
             response = page.request.get(pdf_url)
             if response.ok:
                 save_path.write_bytes(response.body())
+                self._downloaded_urls.add(pdf_url)
                 file_info = {
                     "report_id": report_id,
                     "report_name": report_name,
@@ -408,13 +595,21 @@ class ICEReportScraper:
                 button.click()
             download = download_info.value
 
+            if download.url in self._downloaded_urls:
+                download.cancel()
+                return
+
             suggested = download.suggested_filename
             if not suggested.endswith(".pdf"):
+                return
+            if self._should_ignore_download(suggested, download.url):
+                download.cancel()
                 return
 
             safe_name = re.sub(r'[^\w\-_.]', '_', suggested)
             save_path = save_dir / safe_name
             download.save_as(str(save_path))
+            self._downloaded_urls.add(download.url)
 
             file_info = {
                 "report_id": report_id,
@@ -470,6 +665,70 @@ class ICEReportScraper:
                     )
         except Exception:
             pass
+
+    def _persist_session_state(self, context):
+        """Persist cookies/localStorage to supplement the browser profile."""
+        try:
+            context.storage_state(path=str(self.session_state_path))
+            logger.info("Saved browser session state to %s", self.session_state_path)
+        except Exception as e:
+            logger.warning("Could not persist session state: %s", e)
+
+    def _restore_session_state(self, context):
+        """Restore previously saved cookies/localStorage before scraping."""
+        if not self.session_state_path.exists():
+            return
+
+        try:
+            state = json.loads(self.session_state_path.read_text())
+        except Exception as e:
+            logger.warning("Could not read saved browser session state: %s", e)
+            return
+
+        cookies = state.get("cookies") or []
+        if cookies:
+            try:
+                context.add_cookies(cookies)
+                logger.info("Restored %d cookies from saved session state.", len(cookies))
+            except Exception as e:
+                logger.warning("Could not restore cookies: %s", e)
+
+        origins = state.get("origins") or []
+        if not origins:
+            return
+
+        for origin_state in origins:
+            origin = origin_state.get("origin")
+            local_storage = origin_state.get("localStorage") or []
+            if not origin or not local_storage:
+                continue
+
+            page = context.new_page()
+            try:
+                page.goto(origin, wait_until="domcontentloaded",
+                          timeout=config.PAGE_LOAD_TIMEOUT)
+                page.evaluate(
+                    """entries => {
+                        for (const entry of entries) {
+                            localStorage.setItem(entry.name, entry.value);
+                        }
+                    }""",
+                    local_storage,
+                )
+            except Exception as e:
+                logger.debug("Could not restore localStorage for %s: %s", origin, e)
+            finally:
+                page.close()
+
+    def _should_ignore_option_label(self, label: str) -> bool:
+        """Filter out non-report controls such as cookie preferences."""
+        normalized = re.sub(r"\s+", " ", label).strip().lower()
+        return any(keyword in normalized for keyword in IGNORED_OPTION_LABEL_KEYWORDS)
+
+    def _should_ignore_download(self, link_text: str, url: str) -> bool:
+        """Skip non-report PDFs such as agreements or cookie documents."""
+        haystack = f"{link_text} {url}".lower()
+        return any(keyword in haystack for keyword in IGNORED_LINK_TEXT_KEYWORDS)
 
 
 if __name__ == "__main__":
