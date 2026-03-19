@@ -1,6 +1,10 @@
 """
 ICE Market Report Scraper - Uses Playwright to navigate the ICE website,
 discover available PDF reports, and download them.
+
+Uses a persistent browser profile so cookies/sessions survive across runs.
+On first load, if a CAPTCHA (Google reCAPTCHA v2) is detected, the script
+pauses for the user to solve it manually in the visible browser window.
 """
 
 import logging
@@ -32,9 +36,14 @@ class ICEReportScraper:
         today_dir = self.download_dir / today
         today_dir.mkdir(parents=True, exist_ok=True)
 
+        # Use a persistent browser profile so cookies/sessions survive across runs
+        user_data_dir = config.BASE_DIR / ".browser_profile"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=config.HEADLESS)
-            context = browser.new_context(
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=config.HEADLESS,
                 accept_downloads=True,
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -45,10 +54,13 @@ class ICEReportScraper:
             context.set_default_timeout(config.BROWSER_TIMEOUT)
 
             try:
-                # First, try to discover reports from the report center
+                # Step 0: Open a page to let the user clear any CAPTCHA first
+                self._wait_for_captcha_clearance(context)
+
+                # Step 1: Discover reports from the report center
                 discovered = self._discover_reports_from_center(context)
 
-                # Then scrape each known report page for PDF links
+                # Step 2: Scrape each known report page for PDF links
                 all_report_ids = set(config.REPORT_IDS.keys())
                 for rid in discovered:
                     all_report_ids.add(rid)
@@ -67,12 +79,128 @@ class ICEReportScraper:
                             report_id, report_name, e,
                         )
             finally:
-                browser.close()
+                context.close()
 
         logger.info(
             "Scraping complete. Downloaded %d PDF files.", len(self.downloaded_files)
         )
         return self.downloaded_files
+
+    # ------------------------------------------------------------------ #
+    # CAPTCHA / Agreement Handling
+    # ------------------------------------------------------------------ #
+
+    def _wait_for_captcha_clearance(self, context):
+        """Open ICE and wait for the user to clear any CAPTCHA.
+
+        In headed mode the browser window is visible for the user to
+        interact with. The script polls until the reCAPTCHA disappears.
+        """
+        page = context.new_page()
+        try:
+            logger.info("Opening ICE website for initial session setup...")
+            page.goto(config.ICE_REPORT_CENTER_URL, wait_until="domcontentloaded",
+                      timeout=config.PAGE_LOAD_TIMEOUT)
+            time.sleep(3)
+
+            if self._is_captcha_present(page):
+                if config.HEADLESS:
+                    logger.error(
+                        "CAPTCHA detected but running in headless mode! "
+                        "Please re-run with ICE_HEADLESS=false so you can "
+                        "manually solve the CAPTCHA."
+                    )
+                    raise RuntimeError("CAPTCHA detected in headless mode")
+
+                logger.info("=" * 60)
+                logger.info("CAPTCHA / reCAPTCHA detected!")
+                logger.info("Please solve it in the browser window.")
+                logger.info("The script will wait up to 120 seconds...")
+                logger.info("=" * 60)
+
+                # Poll every 3 seconds for up to 120 seconds
+                for _ in range(40):
+                    time.sleep(3)
+                    if not self._is_captcha_present(page):
+                        logger.info("CAPTCHA cleared! Continuing...")
+                        break
+                else:
+                    logger.warning(
+                        "Timed out waiting for CAPTCHA. Continuing anyway..."
+                    )
+            else:
+                logger.info("No CAPTCHA detected. Session is good.")
+
+            # Handle the "I ACCEPT" agreement if present
+            self._handle_accept_agreement(page)
+            time.sleep(2)
+
+        except PlaywrightTimeout as e:
+            logger.warning("Timeout during initial page load: %s", e)
+        finally:
+            page.close()
+
+    def _is_captcha_present(self, page) -> bool:
+        """Check if any CAPTCHA / bot protection is blocking the page."""
+        captcha_indicators = [
+            # Google reCAPTCHA v2 (the one ICE actually uses)
+            "iframe[src*='google.com/recaptcha']",
+            "iframe[src*='recaptcha/api2']",
+            ".g-recaptcha",
+            "#g-recaptcha",
+            # Cloudflare Turnstile
+            "#cf-wrapper",
+            "iframe[src*='turnstile']",
+            "iframe[src*='challenges.cloudflare.com']",
+            "#challenge-running",
+            "#challenge-stage",
+            # Generic
+            "iframe[src*='captcha']",
+            "iframe[src*='challenge']",
+        ]
+        for selector in captcha_indicators:
+            try:
+                if page.locator(selector).count() > 0:
+                    return True
+            except Exception:
+                continue
+
+        # Also check page title for common challenge pages
+        try:
+            title = page.title().lower()
+            if any(kw in title for kw in [
+                "just a moment", "attention required", "challenge",
+            ]):
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _handle_accept_agreement(self, page):
+        """Click 'Accept All Cookies' and 'I ACCEPT' buttons if present."""
+        try:
+            cookie_btn = page.query_selector(
+                "button:has-text('Accept All Cookies')"
+            )
+            if cookie_btn and cookie_btn.is_visible():
+                cookie_btn.click()
+                time.sleep(1)
+        except Exception:
+            pass
+
+        try:
+            accept_btn = page.query_selector("button:has-text('I ACCEPT')")
+            if accept_btn and accept_btn.is_visible():
+                logger.info("  Accepting Click-Through Agreement...")
+                accept_btn.click()
+                time.sleep(2)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Report Discovery
+    # ------------------------------------------------------------------ #
 
     def _discover_reports_from_center(self, context) -> set[int]:
         """Visit the ICE Report Center and discover available report IDs."""
@@ -82,15 +210,14 @@ class ICEReportScraper:
             logger.info("Visiting ICE Report Center to discover reports...")
             page.goto(config.ICE_REPORT_CENTER_URL, wait_until="domcontentloaded",
                       timeout=config.PAGE_LOAD_TIMEOUT)
+            self._handle_accept_agreement(page)
             # Wait for SPA content to render
             time.sleep(5)
-            # Try waiting for report links to appear
             try:
                 page.wait_for_selector("a[href*='/report/']", timeout=10000)
             except PlaywrightTimeout:
                 logger.info("No report links found after waiting, continuing...")
 
-            # Look for links matching /report/{id} pattern
             links = page.query_selector_all("a[href*='/report/']")
             for link in links:
                 href = link.get_attribute("href") or ""
@@ -103,13 +230,20 @@ class ICEReportScraper:
                         config.REPORT_IDS[rid] = text
                         logger.info("Discovered new report: %d - %s", rid, text)
 
-            logger.info("Discovered %d report IDs from Report Center.", len(discovered_ids))
+            logger.info(
+                "Discovered %d report IDs from Report Center.",
+                len(discovered_ids),
+            )
         except (PlaywrightTimeout, Exception) as e:
             logger.warning("Could not fully load Report Center: %s", e)
         finally:
             page.close()
 
         return discovered_ids
+
+    # ------------------------------------------------------------------ #
+    # Per-Report Scraping
+    # ------------------------------------------------------------------ #
 
     def _scrape_report_page(self, context, report_id: int, report_name: str,
                             save_dir: Path):
@@ -121,8 +255,31 @@ class ICEReportScraper:
         try:
             page.goto(url, wait_until="domcontentloaded",
                       timeout=config.PAGE_LOAD_TIMEOUT)
-            # Wait for SPA content to render
-            time.sleep(5)
+            time.sleep(3)
+
+            # If reCAPTCHA pops up on this specific page, wait for it
+            if self._is_captcha_present(page):
+                if not config.HEADLESS:
+                    logger.info(
+                        "  reCAPTCHA detected on report %d. "
+                        "Please solve it in the browser (waiting 120s)...",
+                        report_id,
+                    )
+                    for _ in range(40):
+                        time.sleep(3)
+                        if not self._is_captcha_present(page):
+                            logger.info("  reCAPTCHA cleared!")
+                            break
+                else:
+                    logger.warning(
+                        "  reCAPTCHA on report %d in headless mode, skipping.",
+                        report_id,
+                    )
+                    return
+
+            # Handle cookies / agreement overlay
+            self._handle_accept_agreement(page)
+            time.sleep(2)
 
             pdf_links = self._find_pdf_links(page)
             download_buttons = self._find_download_buttons(page)
@@ -139,8 +296,7 @@ class ICEReportScraper:
                     page, button, report_id, report_name, save_dir
                 )
 
-            # If no PDFs found via links/buttons, try to find and click
-            # any "Download" or "PDF" related elements
+            # If no PDFs found via links/buttons, try alternatives
             if not pdf_links and not download_buttons:
                 self._try_alternative_download(
                     page, report_id, report_name, save_dir
@@ -151,11 +307,13 @@ class ICEReportScraper:
         finally:
             page.close()
 
+    # ------------------------------------------------------------------ #
+    # PDF Discovery & Download Helpers
+    # ------------------------------------------------------------------ #
+
     def _find_pdf_links(self, page) -> list[tuple[str, str]]:
         """Find all PDF download links on the page."""
         pdf_links = []
-
-        # Look for direct PDF links
         selectors = [
             "a[href$='.pdf']",
             "a[href*='.pdf?']",
@@ -207,7 +365,6 @@ class ICEReportScraper:
                                report_id: int, report_name: str, save_dir: Path):
         """Download a PDF file from a direct URL."""
         try:
-            # Generate a clean filename
             url_filename = Path(urlparse(pdf_url).path).name
             if not url_filename.endswith(".pdf"):
                 url_filename = f"report_{report_id}_{link_text[:30]}.pdf"
@@ -219,7 +376,6 @@ class ICEReportScraper:
                 logger.info("File already exists, skipping: %s", save_path.name)
                 return
 
-            # Use Playwright to download (handles cookies/sessions)
             response = page.request.get(pdf_url)
             if response.ok:
                 save_path.write_bytes(response.body())
@@ -234,7 +390,9 @@ class ICEReportScraper:
                     "file_size": save_path.stat().st_size,
                 }
                 self.downloaded_files.append(file_info)
-                logger.info("Downloaded: %s (%d bytes)", safe_name, file_info["file_size"])
+                logger.info(
+                    "Downloaded: %s (%d bytes)", safe_name, file_info["file_size"]
+                )
             else:
                 logger.warning(
                     "Failed to download %s: HTTP %d", pdf_url, response.status
@@ -252,7 +410,7 @@ class ICEReportScraper:
 
             suggested = download.suggested_filename
             if not suggested.endswith(".pdf"):
-                return  # Skip non-PDF downloads
+                return
 
             safe_name = re.sub(r'[^\w\-_.]', '_', suggested)
             save_path = save_dir / safe_name
@@ -271,7 +429,6 @@ class ICEReportScraper:
             self.downloaded_files.append(file_info)
             logger.info("Downloaded via button: %s", safe_name)
         except (PlaywrightTimeout, Exception):
-            # Button didn't trigger a download, that's fine
             pass
 
     def _try_alternative_download(self, page, report_id: int,
@@ -279,8 +436,7 @@ class ICEReportScraper:
         """Try alternative methods to find and download PDFs."""
         # Check for iframes that might contain reports
         try:
-            frames = page.frames
-            for frame in frames:
+            for frame in page.frames:
                 if frame == page.main_frame:
                     continue
                 frame_url = frame.url
@@ -292,14 +448,18 @@ class ICEReportScraper:
         except Exception:
             pass
 
-        # Check for any data-href or onclick attributes with PDF URLs
+        # Check for data-href or onclick attributes with PDF URLs
         try:
-            elements = page.query_selector_all("[data-href*='.pdf'], [onclick*='.pdf']")
+            elements = page.query_selector_all(
+                "[data-href*='.pdf'], [onclick*='.pdf']"
+            )
             for el in elements:
                 href = el.get_attribute("data-href") or ""
                 if not href:
                     onclick = el.get_attribute("onclick") or ""
-                    pdf_match = re.search(r"(https?://[^\s'\"]+\.pdf)", onclick)
+                    pdf_match = re.search(
+                        r"(https?://[^\s'\"]+\.pdf)", onclick
+                    )
                     if pdf_match:
                         href = pdf_match.group(1)
                 if href:

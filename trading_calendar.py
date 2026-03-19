@@ -3,6 +3,7 @@ Trading Calendar - Determines the most recent trading day for ICE exchanges
 and validates whether downloaded reports match the expected trading date.
 """
 
+from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, timedelta
